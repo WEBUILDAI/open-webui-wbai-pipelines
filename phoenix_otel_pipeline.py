@@ -10,6 +10,7 @@ requirements: opentelemetry-api, opentelemetry-sdk, opentelemetry-exporter-otlp,
 
 import os
 import uuid
+import time
 from typing import Dict, List, Optional, Any
 
 from utils.pipelines.main import get_last_assistant_message
@@ -111,6 +112,38 @@ class Pipeline:
         
         self.tracer_provider = None
         self.tracer = None
+        # Keep track of active spans per message/chat to aggregate multiple
+        # pipeline steps (e.g., user input, task, model output) into a single span
+        self._active_spans: Dict[str, Any] = {}
+        self._span_started_at: Dict[str, float] = {}
+        self._span_state: Dict[str, Dict[str, bool]] = {}
+
+    def _span_key(self, chat_id: Optional[str], message_id: Optional[str]) -> str:
+        """Return a stable key for storing/retrieving the active span.
+
+        Prefer message_id if available (captures a single user/assistant turn),
+        otherwise fall back to chat_id.
+        """
+        return message_id or chat_id or str(uuid.uuid4())
+
+    def _cleanup_stale_spans(self, ttl_seconds: float = 30.0) -> None:
+        """End and remove spans that have been open longer than ttl_seconds.
+
+        This protects against spans that never see a finalization step.
+        """
+        now = time.monotonic()
+        keys_to_end: List[str] = []
+        for key, started_at in list(self._span_started_at.items()):
+            if (now - started_at) > ttl_seconds and key in self._active_spans:
+                keys_to_end.append(key)
+
+        for key in keys_to_end:
+            try:
+                self._active_spans[key].end()
+            finally:
+                self._active_spans.pop(key, None)
+                self._span_started_at.pop(key, None)
+                self._span_state.pop(key, None)
 
     async def on_startup(self) -> None:
         """Initialize Phoenix OTEL when the service starts."""
@@ -144,12 +177,30 @@ class Pipeline:
                 return body
         
         metadata = body.get("metadata", {}) or {}
-        # Prefer metadata, but support top-level fallbacks
-        chat_id = metadata.get("chat_id") or body.get("chat_id") or str(uuid.uuid4())
-        session_id = metadata.get("session_id") or body.get("session_id")
-        message_id = metadata.get("message_id") or body.get("id")
-        user_id = metadata.get("user_id") or (user.get("email") if user else None) or (user.get("id") if user else None)
-        task_name = metadata.get("task")
+        # Prefer metadata, but support top-level fallbacks and nested objects
+        chat_id = (
+            metadata.get("chat_id")
+            or body.get("chat_id")
+            or (body.get("chat", {}) or {}).get("id")
+            or str(uuid.uuid4())
+        )
+        session_id = (
+            metadata.get("session_id")
+            or body.get("session_id")
+            or (body.get("session", {}) or {}).get("id")
+        )
+        message_id = (
+            metadata.get("message_id")
+            or body.get("id")
+            or (body.get("message", {}) or {}).get("id")
+        )
+        user_id = (
+            metadata.get("user_id")
+            or (user.get("email") if user else None)
+            or (user.get("id") if user else None)
+            or (body.get("user", {}) or {}).get("id")
+        )
+        task_name = metadata.get("task") or body.get("task")
         
         # Handle temporary chats
         if chat_id == "local":
@@ -159,41 +210,54 @@ class Pipeline:
         metadata["chat_id"] = chat_id
         body["metadata"] = metadata
         
-        # Create span for this request
-        with self.tracer.start_as_current_span("ChatCompletion") as span:
-            # Add conversation attributes
+        # Retrieve or create a single span for this message/chat
+        span_key = self._span_key(chat_id, message_id)
+        span = self._active_spans.get(span_key)
+        if span is None:
+            span = self.tracer.start_span("ChatCompletion")
+            # Base attributes for the aggregate span
             span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
-            # Keep existing behavior for SESSION_ID while also adding explicit identifiers
             span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, body.get("model", "unknown"))
-            
-            # Add custom attributes
+            model_name = (
+                body.get("model")
+                or metadata.get("model")
+                or (body.get("llm", {}) or {}).get("model_name")
+                or "unknown"
+            )
+            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, model_name)
             span.set_attribute("interface", "open-webui")
             span.set_attribute("chat.id", chat_id)
             if session_id:
                 span.set_attribute("session.id", session_id)
             if message_id:
                 span.set_attribute("message.id", message_id)
-            if task_name:
-                span.set_attribute("task", task_name)
-            
-            # Add user ID if available
             if user_id:
                 span.set_attribute("user.id", user_id)
-            
-            # Add messages as input
-            try:
-                messages = body.get("messages", [])
-                span.set_attribute(SpanAttributes.INPUT_VALUE, str(messages))
-                
-                # Get user's current message
-                for message in reversed(messages):
-                    if message["role"] == "user":
-                        span.set_attribute("user.message", message.get("content", ""))
-                        break
-            except Exception as ex:
-                span.set_status(Status(StatusCode.ERROR))
-                span.record_exception(ex)
+            self._active_spans[span_key] = span
+            self._span_started_at[span_key] = time.monotonic()
+            self._span_state[span_key] = {"has_input": False, "has_output": False}
+
+        # Record this inlet step as an event on the aggregate span
+        try:
+            messages = body.get("messages", [])
+            # Attach full input messages
+            span.add_event(
+                name="user_input",
+                attributes={
+                    SpanAttributes.INPUT_VALUE: str(messages),
+                    "task": task_name or "user_response",
+                },
+            )
+            self._span_state[span_key]["has_input"] = True
+
+            # Also include the last user message as a convenience attribute on the span
+            for message in reversed(messages):
+                if message["role"] == "user":
+                    span.set_attribute("user.message", message.get("content", ""))
+                    break
+        except Exception as ex:
+            span.set_status(Status(StatusCode.ERROR))
+            span.record_exception(ex)
         
         return body
 
@@ -217,36 +281,63 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
         
-        # Create span for the model response
-        with self.tracer.start_as_current_span("ChatCompletion") as span:
-            # Add conversation attributes
+        # Retrieve or create the aggregate span for this message/chat
+        span_key = self._span_key(chat_id, message_id)
+        span = self._active_spans.get(span_key)
+        if span is None:
+            # Fallback: create the span if inlet was skipped for some reason
+            span = self.tracer.start_span("ChatCompletion")
             span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
             span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, body.get("model", "unknown"))
-            span.set_attribute(SpanAttributes.OUTPUT_VALUE, assistant_message)
-            
-            # Add custom attributes
+            model_name = (
+                body.get("model")
+                or (body.get("metadata", {}) or {}).get("model")
+                or (body.get("llm", {}) or {}).get("model_name")
+                or "unknown"
+            )
+            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, model_name)
             span.set_attribute("interface", "open-webui")
             span.set_attribute("chat.id", chat_id)
             if session_id:
                 span.set_attribute("session.id", session_id)
             if message_id:
                 span.set_attribute("message.id", message_id)
-            
-            # Add token usage if available
-            if assistant_message_obj and "usage" in assistant_message_obj:
-                usage = assistant_message_obj["usage"]
-                if isinstance(usage, dict):
-                    input_tokens = usage.get("prompt_eval_count") or usage.get("prompt_tokens")
-                    output_tokens = usage.get("eval_count") or usage.get("completion_tokens")
-                    
-                    if input_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, input_tokens)
-                    
-                    if output_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, output_tokens)
-                    
-                    if input_tokens is not None and output_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, input_tokens + output_tokens)
+            self._active_spans[span_key] = span
+            self._span_started_at[span_key] = time.monotonic()
+            self._span_state[span_key] = {"has_input": False, "has_output": False}
+
+        # Record the assistant output as an event on the same span
+        event_attributes: Dict[str, Any] = {SpanAttributes.OUTPUT_VALUE: assistant_message}
+
+        # Add token usage if available
+        if assistant_message_obj and "usage" in assistant_message_obj:
+            usage = assistant_message_obj["usage"]
+            if isinstance(usage, dict):
+                input_tokens = usage.get("prompt_eval_count") or usage.get("prompt_tokens")
+                output_tokens = usage.get("eval_count") or usage.get("completion_tokens")
+                if input_tokens is not None:
+                    event_attributes[SpanAttributes.LLM_TOKEN_COUNT_PROMPT] = input_tokens
+                if output_tokens is not None:
+                    event_attributes[SpanAttributes.LLM_TOKEN_COUNT_COMPLETION] = output_tokens
+                if input_tokens is not None and output_tokens is not None:
+                    event_attributes[SpanAttributes.LLM_TOKEN_COUNT_TOTAL] = input_tokens + output_tokens
+
+        span.add_event(name="assistant_output", attributes=event_attributes)
+        # Also set the span-level output attribute so it shows up in Phoenix table
+        span.set_attribute(SpanAttributes.OUTPUT_VALUE, assistant_message)
+        self._span_state[span_key]["has_output"] = True
+
+        # If this step looks like a finalizer (e.g., title_generation), end the span now.
+        task_name = (body.get("metadata", {}) or {}).get("task") or body.get("task")
+        if task_name in {"title_generation", "conversation_end"}:
+            try:
+                span.end()
+            finally:
+                self._active_spans.pop(span_key, None)
+                self._span_started_at.pop(span_key, None)
+                self._span_state.pop(span_key, None)
+        else:
+            # Opportunistic cleanup of stale spans to avoid leaks
+            self._cleanup_stale_spans(ttl_seconds=30.0)
         
         return body

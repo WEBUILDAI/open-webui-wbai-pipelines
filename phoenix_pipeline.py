@@ -34,17 +34,12 @@ class Pipeline:
         pipelines: List[str] = []
         priority: int = 0
         project_name: str = "open-webui"
-        phoenix_space_id: Optional[str] = None
         phoenix_api_key: Optional[str] = None
         phoenix_collector_endpoint: Optional[str] = None
 
     def initialize_phoenix(self):
         """Initialize the Phoenix client and OpenTelemetry tracer."""
         try:
-            # Set environment variables for Phoenix if provided in valves
-            if self.valves.phoenix_space_id:
-                os.environ["PHOENIX_SPACE_ID"] = self.valves.phoenix_space_id
-            
             if self.valves.phoenix_api_key:
                 os.environ["PHOENIX_API_KEY"] = self.valves.phoenix_api_key
                 
@@ -82,7 +77,6 @@ class Pipeline:
             **{
                 "pipelines": ["*"],
                 "project_name": os.getenv("PHOENIX_PROJECT_NAME", "open-webui"),
-                "phoenix_space_id": os.getenv("PHOENIX_SPACE_ID", None),
                 "phoenix_api_key": os.getenv("PHOENIX_API_KEY", None),
                 "phoenix_collector_endpoint": os.getenv("PHOENIX_COLLECTOR_ENDPOINT", None),
             }
