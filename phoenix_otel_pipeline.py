@@ -159,6 +159,8 @@ class Pipeline:
         self.call_context_ttl_seconds = int(os.getenv("WBAI_CALL_CTX_TTL", "300"))
         # Per-request (per message) root contexts to group a single execution/turn
         self.request_root_contexts: Dict[str, Dict[str, Any]] = {}
+        # Live per-request spans kept open between inlet and outlet, keyed by message_id
+        self.live_request_spans: Dict[str, trace.Span] = {}
 
     def _log(self, level: str, message: str) -> None:
         """Lightweight logger; DEBUG messages controlled by valves.debug."""
@@ -322,15 +324,9 @@ class Pipeline:
                 if call_key and not metadata.get("message_id"):
                     metadata["message_id"] = call_key
 
-            # Deterministic: always parent to per-request (message) root only
-            parent_ctx = self._get_or_create_request_root_context(message_id, chat_id, session_id)
-            parent_source = "request_root" if parent_ctx is not None else "none"
-
-            # Start and end an inlet span; pass its context to outlet via metadata
-            if parent_ctx is not None:
-                span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL, context=parent_ctx)
-            else:
-                span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
+            # Deterministic: single span per request; open it now and keep it for outlet
+            span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
+            parent_source = "single_span"
             # Attributes
             self._set_attr(span, SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
             self._set_attr(span, SpanAttributes.SESSION_ID, session_id)
@@ -368,14 +364,15 @@ class Pipeline:
             })
             body["metadata"] = metadata
 
-            # Persist the first inlet's context so any subsequent inlets for the same message can join the same trace
-            self._maybe_store_call_context(call_key, sc)
+            # Keep the span open for outlet, keyed by message_id
+            if message_id:
+                self.live_request_spans[message_id] = span
 
             self._log(
                 "INFO",
                 (
                     f"Inlet grouped | chat_id={chat_id} session_id={session_id} message_id={message_id} "
-                    f"parent={parent_source} trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')}"
+                    f"parent={parent_source} trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')} span_opened=True"
                 ),
             )
 
@@ -389,11 +386,8 @@ class Pipeline:
                 except Exception:
                     pass
         finally:
-            try:
-                if span is not None:
-                    span.end()
-            except Exception:
-                pass
+            # Do not end the span; keep it open for outlet to attach output and close
+            pass
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
@@ -416,42 +410,34 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        # Deterministic: parent outlet to the per-request root only
-        parent_ctx = self._get_or_create_request_root_context(message_id, chat_id, session_id)
-        parent_source = "request_root" if parent_ctx is not None else "none"
-
-        span_kwargs = {"name": "llm.chat_completion.outlet", "kind": SpanKind.INTERNAL}
-        if parent_ctx is not None:
-            with self.tracer.start_as_current_span(**span_kwargs, context=parent_ctx) as span:
-                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
-                self._set_attr(span, "wbai.parent.source", parent_source)
-                try:
-                    body_json = json.dumps(body, ensure_ascii=False)
-                    self._set_attr(span, "wbai.body", body_json)
-                    self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
-                except Exception as _:
-                    pass
-                span.set_status(Status(StatusCode.OK))
-        else:
-            with self.tracer.start_as_current_span(**span_kwargs) as span:
-                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
-                self._set_attr(span, "wbai.parent.source", parent_source)
-                try:
-                    body_json = json.dumps(body, ensure_ascii=False)
-                    self._set_attr(span, "wbai.body", body_json)
-                    self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
-                except Exception as _:
-                    pass
-                span.set_status(Status(StatusCode.OK))
+        # Deterministic: close the single span opened in inlet
+        span = None
+        if message_id and message_id in self.live_request_spans:
+            span = self.live_request_spans.pop(message_id, None)
+        if span is None:
+            # Fallback: create a span to avoid losing data
+            span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
+        self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
         try:
-            sc = trace.get_current_span().get_span_context()
+            body_json = json.dumps(body, ensure_ascii=False)
+            self._set_attr(span, "wbai.body", body_json)
+            self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
+        except Exception as _:
+            pass
+        span.set_status(Status(StatusCode.OK))
+        try:
+            sc = span.get_span_context()
             self._log(
                 "INFO",
                 (
-                    f"Outlet grouped | chat_id={chat_id} session_id={session_id} message_id={message_id} "
-                    f"parent={parent_source} trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')}"
+                    f"Outlet closing span | chat_id={chat_id} session_id={session_id} message_id={message_id} "
+                    f"trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')}"
                 ),
             )
+        except Exception:
+            pass
+        try:
+            span.end()
         except Exception:
             pass
         return body
