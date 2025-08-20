@@ -17,6 +17,7 @@ from utils.pipelines.main import get_last_assistant_message
 from pydantic import BaseModel
 from phoenix.otel import register
 from opentelemetry import trace
+from opentelemetry.trace import Span
 from openinference.instrumentation.openai import OpenAIInstrumentor
 
 
@@ -37,33 +38,49 @@ class Pipeline:
         phoenix_api_key: Optional[str] = None
         phoenix_collector_endpoint: Optional[str] = None
 
-    def initialize_phoenix(self):
+    def initialize_phoenix(self) -> None:
         """Initialize the Phoenix client and OpenTelemetry tracer."""
         try:
+            # Only (re)register once per process
+            if getattr(self, "_phoenix_initialized", False):
+                if self.tracer is None:
+                    self.tracer = trace.get_tracer("open-webui.phoenix_pipeline")
+                return
+
+            # Load configuration from valves/env
             if self.valves.phoenix_api_key:
                 os.environ["PHOENIX_API_KEY"] = self.valves.phoenix_api_key
-                
-            if self.valves.phoenix_collector_endpoint:
-                os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = self.valves.phoenix_collector_endpoint
 
-            # Format the API key as a Bearer token if needed
-            if "PHOENIX_API_KEY" in os.environ and not os.environ["PHOENIX_API_KEY"].startswith("Bearer "):
-                os.environ["PHOENIX_API_KEY"] = f"Bearer {os.environ['PHOENIX_API_KEY']}"
-            
-            # Append /v1/traces to collector endpoint if needed
-            if "PHOENIX_COLLECTOR_ENDPOINT" in os.environ and not os.environ["PHOENIX_COLLECTOR_ENDPOINT"].endswith("/v1/traces"):
-                os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = os.environ["PHOENIX_COLLECTOR_ENDPOINT"] + "/v1/traces"
-            
-            # Register Phoenix tracer with HTTP transport
+            # Normalize API key to Bearer format
+            api_key = os.getenv("PHOENIX_API_KEY")
+            if api_key and not api_key.lower().startswith("bearer "):
+                api_key = f"Bearer {api_key}"
+                os.environ["PHOENIX_API_KEY"] = api_key
+
+            endpoint = self.valves.phoenix_collector_endpoint or os.getenv("PHOENIX_COLLECTOR_ENDPOINT")
+            if endpoint:
+                # Ensure '/v1/traces' suffix is present exactly once
+                endpoint = endpoint.rstrip("/")
+                if not endpoint.endswith("/v1/traces"):
+                    endpoint = f"{endpoint}/v1/traces"
+                os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = endpoint
+
+            # Register Phoenix tracer with HTTP transport (avoid duplicate global registration)
             self.tracer_provider = register(
-                headers={"Authorization": os.getenv("PHOENIX_API_KEY")},
-                endpoint=os.getenv("PHOENIX_COLLECTOR_ENDPOINT") + "/v1/traces",
-                auto_instrument=True
+                headers={"authorization": os.getenv("PHOENIX_API_KEY") or ""},
+                endpoint=os.getenv("PHOENIX_COLLECTOR_ENDPOINT"),
+                auto_instrument=False,
             )
-            
-            # Get a tracer for this component
-            OpenAIInstrumentor().instrument(tracer_provider=self.tracer_provider)
-            
+
+            # Instrument OpenAI once, using the same provider
+            if not getattr(self, "_openai_instrumented", False):
+                OpenAIInstrumentor().instrument(tracer_provider=self.tracer_provider)
+                self._openai_instrumented = True
+
+            # Create tracer for manual spans
+            self.tracer = trace.get_tracer("open-webui.phoenix_pipeline")
+            self._phoenix_initialized = True
+
         except Exception as e:
             print(f"Phoenix error: {e}. Please check your Phoenix configuration.")
 
@@ -84,6 +101,10 @@ class Pipeline:
         
         self.tracer_provider = None
         self.tracer = None
+        self._phoenix_initialized = False
+        self._openai_instrumented = False
+        # Active spans keyed by chat_id
+        self._active_spans: Dict[str, Span] = {}
 
     async def on_startup(self):
         """Initialize Phoenix when the service starts."""
@@ -100,6 +121,8 @@ class Pipeline:
     async def on_valves_updated(self):
         """Reset Phoenix client when valves are updated."""
         print("Valves updated, resetting Phoenix client")
+        # Allow re-init on next request
+        self._phoenix_initialized = False
         self.initialize_phoenix()
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
@@ -136,14 +159,23 @@ class Pipeline:
         if user_email:
             attributes["user_id"] = user_email
         
-        # Create a span for this request
-        with self.tracer.start_as_current_span(f"user_request:{chat_id}") as span:
-            # Set span attributes
-            for key, value in attributes.items():
-                span.set_attribute(key, value)
-            
-            # Set input data
-            span.set_attribute("input", str(body["messages"]))
+        # Start or reuse a conversation span per chat
+        span = self._active_spans.get(chat_id)
+        if span is None:
+            span = self.tracer.start_span(f"conversation:{chat_id}")
+            self._active_spans[chat_id] = span
+
+        # Update attributes on the active span
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+
+        # Persist the incoming messages for later aggregation
+        try:
+            last_three = body.get("messages", [])[-3:]
+            span.set_attribute("messages.last_three", json.dumps(last_three))
+        except Exception:
+            # Do not fail pipeline on serialization issues
+            pass
         
         return body
 
@@ -184,13 +216,29 @@ class Pipeline:
                     attributes["tokens.output"] = output_tokens
                     attributes["tokens.total"] = input_tokens + output_tokens
         
-        # Create a span for the model response
-        with self.tracer.start_as_current_span(f"model_response:{chat_id}") as span:
-            # Set span attributes
-            for key, value in attributes.items():
-                span.set_attribute(key, value)
-            
-            # Set output data
-            span.set_attribute("output", assistant_message)
+        # Fetch active span; if missing, create a best-effort span
+        span = self._active_spans.get(chat_id)
+        if span is None:
+            span = self.tracer.start_span(f"conversation:{chat_id}")
+
+        # Update span attributes
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+
+        # Attach messages summary and model output
+        try:
+            last_three = body.get("messages", [])[-3:]
+            span.set_attribute("messages.last_three", json.dumps(last_three))
+        except Exception:
+            pass
+
+        span.set_attribute("output", assistant_message)
+
+        # End the span for this conversation round
+        try:
+            span.end()
+        finally:
+            if chat_id in self._active_spans:
+                del self._active_spans[chat_id]
         
         return body
