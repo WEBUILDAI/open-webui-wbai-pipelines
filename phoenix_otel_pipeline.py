@@ -8,19 +8,20 @@ description: A filter pipeline that uses OpenTelemetry instrumentation for Phoen
 requirements: opentelemetry-api, opentelemetry-sdk, opentelemetry-exporter-otlp, openinference-semantic-conventions
 """
 
+from utils.pipelines.main import get_last_assistant_message
 import os
 import uuid
+import hashlib
 from typing import Dict, List, Optional, Any
-
-from utils.pipelines.main import get_last_assistant_message
-from openinference.semconv.resource import ResourceAttributes
+from openinference.semconv.resource import ResourceAttributes as OIResourceAttributes
 from openinference.semconv.trace import SpanAttributes
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import Status, StatusCode, SpanKind, Link, SpanContext, TraceFlags, TraceState
+from opentelemetry.semconv.resource import ResourceAttributes as OTelResourceAttributes
 from pydantic import BaseModel
 
 def get_last_assistant_message_obj(messages: List[dict]) -> dict:
@@ -38,6 +39,20 @@ class Pipeline:
         project_name: str = "open-webui"
         phoenix_collector_endpoint: Optional[str] = None
         phoenix_api_key: Optional[str] = None
+
+    def _set_attr(self, span: "trace.Span", key: str, value: Optional[Any]) -> None:
+        """Set span attribute only when value is not None."""
+        if value is not None:
+            span.set_attribute(key, value)
+
+    def _hash_user_id(self, user_id: Optional[str]) -> Optional[str]:
+        """Return a stable SHA-256 hash of the user id (with optional salt) or None."""
+        if user_id is None:
+            return None
+        salt = os.getenv("WBAI_USER_ID_SALT", "")
+        hasher = hashlib.sha256()
+        hasher.update((salt + str(user_id)).encode("utf-8"))
+        return hasher.hexdigest()
 
     def initialize_phoenix_otel(self) -> None:
         """Initialize OpenTelemetry with Phoenix collector configuration."""
@@ -57,38 +72,46 @@ class Pipeline:
                     api_key = f"Bearer {api_key}"
                 headers["Authorization"] = api_key
 
-            # Check if we're initializing for the first time or reconfiguring
-            if self.tracer_provider is None:
-                # First-time initialization
-                # Configure resource with project name
-                resource = Resource(attributes={
-                    ResourceAttributes.PROJECT_NAME: self.valves.project_name
-                })
+            # Always recreate a fresh TracerProvider to avoid duplicate exporters
+            # Resource: include standard OTel identity and OpenInference project name
+            service_name = os.getenv("SERVICE_NAME", "open-webui")
+            service_version = os.getenv("SERVICE_VERSION", "1.0.0")
+            deployment_env = os.getenv("ENV", "dev")
+            resource = Resource(attributes={
+                OTelResourceAttributes.SERVICE_NAME: service_name,
+                OTelResourceAttributes.SERVICE_VERSION: service_version,
+                "deployment.environment": deployment_env,
+                OIResourceAttributes.PROJECT_NAME: self.valves.project_name,
+            })
 
-                # Set up tracer provider with resource
-                tracer_provider = TracerProvider(resource=resource)
-                trace.set_tracer_provider(tracer_provider)
-                self.tracer_provider = tracer_provider
-            else:
-                # We're reconfiguring - clean up existing span processors if any
-                # This is needed to avoid having multiple exporters pointing to different endpoints
-                try:
-                    if hasattr(self.tracer_provider, "_span_processors"):
-                        # Get a copy of the list to avoid modification during iteration
-                        for processor in list(getattr(self.tracer_provider, "_span_processors", [])):
-                            self.tracer_provider.remove_span_processor(processor)
-                except Exception as e:
-                    print(f"Warning: Could not remove existing span processors: {e}")
+            # Shut down previous span processor if present
+            try:
+                if getattr(self, "span_processor", None) is not None:
+                    self.span_processor.shutdown()
+            except Exception as e:
+                print(f"Warning: Could not shutdown previous span processor: {e}")
+
+            tracer_provider = TracerProvider(resource=resource)
+            trace.set_tracer_provider(tracer_provider)
+            self.tracer_provider = tracer_provider
             
             # Create and register exporter
             span_exporter = OTLPSpanExporter(endpoint=collector_endpoint, headers=headers)
-            span_processor = SimpleSpanProcessor(span_exporter=span_exporter)
+            span_processor = BatchSpanProcessor(span_exporter)
             self.tracer_provider.add_span_processor(span_processor)
+            self.span_processor = span_processor
             
             # Get tracer for this component
             self.tracer = trace.get_tracer("phoenix_otel_pipeline")
             
-            print(f"Phoenix OTEL instrumentation initialized with project: {self.valves.project_name}")
+            print(
+                f"Phoenix OTEL initialized | service.name={service_name} "
+                f"service.version={service_version} env={deployment_env}"
+            )
+            print(
+                f"OTLP HTTP exporter endpoint: {collector_endpoint} "
+                f"auth={'set' if 'Authorization' in headers else 'none'}"
+            )
         except Exception as e:
             print(f"Phoenix OTEL initialization error: {e}. Please check your Phoenix configuration.")
             self.tracer = None
@@ -111,6 +134,7 @@ class Pipeline:
         
         self.tracer_provider = None
         self.tracer = None
+        self.span_processor = None
 
     async def on_startup(self) -> None:
         """Initialize Phoenix OTEL when the service starts."""
@@ -128,7 +152,15 @@ class Pipeline:
         print("Phoenix OTEL pipeline shutting down")
         if self.tracer_provider:
             # Flush any pending spans
-            self.tracer_provider.force_flush()
+            try:
+                self.tracer_provider.force_flush()
+            except Exception:
+                pass
+        try:
+            if self.span_processor is not None:
+                self.span_processor.shutdown()
+        except Exception:
+            pass
 
     async def on_valves_updated(self) -> None:
         """Reset Phoenix OTEL client when valves are updated."""
@@ -138,6 +170,7 @@ class Pipeline:
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming requests before they reach the model."""
         print("Inlet function called")
+        span = None
         try:
             if not self.tracer:
                 self.initialize_phoenix_otel()
@@ -158,30 +191,54 @@ class Pipeline:
             if chat_id == "local":
                 chat_id = f"temporary-session-{session_id}"
 
-            # Create span for this request
-            with self.tracer.start_as_current_span("ChatCompletion") as span:
-                # Add conversation attributes
-                span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
-                span.set_attribute(SpanAttributes.SESSION_ID, session_id)
-                span.set_attribute(SpanAttributes.LLM_MODEL_NAME, model_id)
-                span.set_attribute("wbai.interface", interface)
-                span.set_attribute("wbai.chat.id", chat_id)
-                span.set_attribute("wbai.session.id", session_id)
-                span.set_attribute("wbai.message.id", message_id)
-                span.set_attribute("wbai.task", task_name)
-                span.set_attribute("wbai.user.id", user_id)
+            # Start and end an inlet span; pass its context to outlet via metadata
+            span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
+            # Attributes
+            self._set_attr(span, SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
+            self._set_attr(span, SpanAttributes.SESSION_ID, session_id)
+            self._set_attr(span, SpanAttributes.LLM_MODEL_NAME, model_id)
+            self._set_attr(span, "wbai.interface", interface)
+            self._set_attr(span, "wbai.chat.id", chat_id)
+            self._set_attr(span, "wbai.session.id", session_id)
+            self._set_attr(span, "wbai.message.id", message_id)
+            self._set_attr(span, "wbai.task", task_name)
+            user_hash = self._hash_user_id(user_id)
+            self._set_attr(span, "wbai.user.hash", user_hash)
 
-                messages = body.get("messages", [])
-                # from messages get role and content
-                messages_str = ""
-                for message in messages:
-                    messages_str += f"{message['content']}"
-                span.set_attribute(SpanAttributes.INPUT_VALUE, messages_str)
-                span.set_status(Status(StatusCode.OK))
+            messages = body.get("messages", [])
+            # Add lightweight events and capped input
+            concatenated = []
+            for m in messages:
+                role = m.get("role")
+                content = m.get("content", "")
+                span.add_event("message", {"role": role, "length": len(content)})
+                concatenated.append(str(content))
+            input_value = "".join(concatenated)
+            self._set_attr(span, SpanAttributes.INPUT_VALUE, input_value[: self.max_attribute_length])
+
+            # Expose trace context for outlet linking
+            sc = span.get_span_context()
+            metadata.setdefault("trace_ctx", {
+                "trace_id": format(sc.trace_id, "032x"),
+                "span_id": format(sc.span_id, "016x"),
+            })
+            body["metadata"] = metadata
+
+            span.set_status(Status(StatusCode.OK))
         except Exception as e:
             print(f"Error in inlet: {e}")
-            span.set_status(Status(StatusCode.ERROR))
-            span.record_exception(e)
+            if span is not None:
+                try:
+                    span.set_status(Status(StatusCode.ERROR))
+                    span.record_exception(e)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if span is not None:
+                    span.end()
+            except Exception:
+                pass
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
@@ -204,15 +261,30 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        current_span = trace.get_current_span()
-        if current_span:
-            current_span.set_attribute(SpanAttributes.OUTPUT_VALUE, assistant_message)
-            current_span.set_status(Status(StatusCode.OK))
+        # Attempt to link to inlet span using stored context
+        link = None
+        try:
+            meta_ctx = metadata.get("trace_ctx")
+            if isinstance(meta_ctx, dict) and meta_ctx.get("trace_id") and meta_ctx.get("span_id"):
+                sc = SpanContext(
+                    trace_id=int(meta_ctx["trace_id"], 16),
+                    span_id=int(meta_ctx["span_id"], 16),
+                    is_remote=False,
+                    trace_flags=TraceFlags.SAMPLED,
+                    trace_state=TraceState(),
+                )
+                link = Link(sc)
+        except Exception:
+            link = None
+
+        span_kwargs = {"name": "llm.chat_completion.outlet", "kind": SpanKind.INTERNAL}
+        if link is not None:
+            with self.tracer.start_as_current_span(**span_kwargs, links=[link]) as span:
+                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
+                span.set_status(Status(StatusCode.OK))
         else:
-            print("No current span found")
-            print(f"Body: {body}")
-            print(f"Assistant message: {assistant_message}")
-            print(f"Assistant message obj: {assistant_message_obj}")
-            print(f"Current span: {current_span}")
-            print(f"Trace: {trace}")
+            with self.tracer.start_as_current_span(**span_kwargs) as span:
+                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
+                span.set_status(Status(StatusCode.OK))
+
         return body
