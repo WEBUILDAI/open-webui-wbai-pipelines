@@ -138,63 +138,50 @@ class Pipeline:
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming requests before they reach the model."""
         print("Inlet function called")
-        if not self.tracer:
-            self.initialize_phoenix_otel()
+        try:
             if not self.tracer:
-                return body
-        
-        metadata = body.get("metadata", {}) or {}
-        # Prefer metadata, but support top-level fallbacks
-        chat_id = metadata.get("chat_id") or body.get("chat_id") or str(uuid.uuid4())
-        session_id = metadata.get("session_id") or body.get("session_id")
-        message_id = metadata.get("message_id") or body.get("id")
-        user_id = metadata.get("user_id") or (user.get("email") if user else None) or (user.get("id") if user else None)
-        task_name = metadata.get("task")
-        
-        # Handle temporary chats
-        if chat_id == "local":
-            session_id = session_id or metadata.get("session_id")
-            chat_id = f"temporary-session-{session_id}"
-        
-        metadata["chat_id"] = chat_id
-        body["metadata"] = metadata
-        
-        # Create span for this request
-        with self.tracer.start_as_current_span("ChatCompletion") as span:
-            # Add conversation attributes
-            span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
-            # Keep existing behavior for SESSION_ID while also adding explicit identifiers
-            span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, body.get("model", "unknown"))
-            
-            # Add custom attributes
-            span.set_attribute("interface", "open-webui")
-            span.set_attribute("chat.id", chat_id)
-            if session_id:
-                span.set_attribute("session.id", session_id)
-            if message_id:
-                span.set_attribute("message.id", message_id)
-            if task_name:
-                span.set_attribute("task", task_name)
-            
-            # Add user ID if available
-            if user_id:
-                span.set_attribute("user.id", user_id)
-            
-            # Add messages as input
-            try:
+                self.initialize_phoenix_otel()
+                if not self.tracer:
+                    return body
+
+            metadata = body.get("metadata", {}) or {}
+            # Prefer metadata, but support top-level fallbacks
+            user_id = metadata.get("user_id")
+            chat_id = metadata.get("chat_id")
+            message_id = metadata.get("message_id")
+            session_id = metadata.get("session_id")
+            interface = metadata.get("interface")
+            model_id = metadata.get("model_id")
+            task_name = metadata.get("task")
+
+            # Handle temporary chats
+            if chat_id == "local":
+                chat_id = f"temporary-session-{session_id}"
+
+            # Create span for this request
+            with self.tracer.start_as_current_span("ChatCompletion") as span:
+                # Add conversation attributes
+                span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
+                span.set_attribute(SpanAttributes.SESSION_ID, session_id)
+                span.set_attribute(SpanAttributes.LLM_MODEL_NAME, model_id)
+                span.set_attribute("wbai.interface", interface)
+                span.set_attribute("wbai.chat.id", chat_id)
+                span.set_attribute("wbai.session.id", session_id)
+                span.set_attribute("wbai.message.id", message_id)
+                span.set_attribute("wbai.task", task_name)
+                span.set_attribute("wbai.user.id", user_id)
+
                 messages = body.get("messages", [])
-                span.set_attribute(SpanAttributes.INPUT_VALUE, str(messages))
-                
-                # Get user's current message
-                for message in reversed(messages):
-                    if message["role"] == "user":
-                        span.set_attribute("user.message", message.get("content", ""))
-                        break
-            except Exception as ex:
-                span.set_status(Status(StatusCode.ERROR))
-                span.record_exception(ex)
-        
+                # from messages get role and content
+                messages_str = ""
+                for message in messages:
+                    messages_str += f"{message['content']}"
+                span.set_attribute(SpanAttributes.INPUT_VALUE, messages_str)
+                span.set_status(Status(StatusCode.OK))
+        except Exception as e:
+            print(f"Error in inlet: {e}")
+            span.set_status(Status(StatusCode.ERROR))
+            span.record_exception(e)
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
@@ -216,37 +203,16 @@ class Pipeline:
         # Get the model response
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
-        
-        # Create span for the model response
-        with self.tracer.start_as_current_span("ChatCompletion") as span:
-            # Add conversation attributes
-            span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
-            span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-            span.set_attribute(SpanAttributes.LLM_MODEL_NAME, body.get("model", "unknown"))
-            span.set_attribute(SpanAttributes.OUTPUT_VALUE, assistant_message)
-            
-            # Add custom attributes
-            span.set_attribute("interface", "open-webui")
-            span.set_attribute("chat.id", chat_id)
-            if session_id:
-                span.set_attribute("session.id", session_id)
-            if message_id:
-                span.set_attribute("message.id", message_id)
-            
-            # Add token usage if available
-            if assistant_message_obj and "usage" in assistant_message_obj:
-                usage = assistant_message_obj["usage"]
-                if isinstance(usage, dict):
-                    input_tokens = usage.get("prompt_eval_count") or usage.get("prompt_tokens")
-                    output_tokens = usage.get("eval_count") or usage.get("completion_tokens")
-                    
-                    if input_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, input_tokens)
-                    
-                    if output_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, output_tokens)
-                    
-                    if input_tokens is not None and output_tokens is not None:
-                        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, input_tokens + output_tokens)
-        
+
+        current_span = trace.get_current_span()
+        if current_span:
+            current_span.set_attribute(SpanAttributes.OUTPUT_VALUE, assistant_message)
+            current_span.set_status(Status(StatusCode.OK))
+        else:
+            print("No current span found")
+            print(f"Body: {body}")
+            print(f"Assistant message: {assistant_message}")
+            print(f"Assistant message obj: {assistant_message_obj}")
+            print(f"Current span: {current_span}")
+            print(f"Trace: {trace}")
         return body
