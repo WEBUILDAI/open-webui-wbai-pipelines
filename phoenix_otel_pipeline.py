@@ -12,6 +12,7 @@ from utils.pipelines.main import get_last_assistant_message
 import os
 import uuid
 import hashlib
+import json
 from typing import Dict, List, Optional, Any
 import time
 from openinference.semconv.resource import ResourceAttributes as OIResourceAttributes
@@ -49,6 +50,7 @@ class Pipeline:
         project_name: str = "open-webui"
         phoenix_collector_endpoint: Optional[str] = None
         phoenix_api_key: Optional[str] = None
+        debug: bool = False
 
     def _set_attr(self, span: "trace.Span", key: str, value: Optional[Any]) -> None:
         """Set span attribute only when value is not None."""
@@ -144,6 +146,7 @@ class Pipeline:
                 "project_name": os.getenv("PHOENIX_PROJECT_NAME", "open-webui"),
                 "phoenix_collector_endpoint": os.getenv("PHOENIX_COLLECTOR_ENDPOINT", None),
                 "phoenix_api_key": os.getenv("PHOENIX_API_KEY", None),
+                "debug": os.getenv("DEBUG_MODE", "false").lower() == "true",
             }
         )
         
@@ -155,6 +158,14 @@ class Pipeline:
         # Keyed strictly by message_id
         self.call_contexts: Dict[str, Dict[str, Any]] = {}
         self.call_context_ttl_seconds = int(os.getenv("WBAI_CALL_CTX_TTL", "300"))
+        # Persistent per-chat root span contexts to group all turns in one chat
+        self.chat_root_contexts: Dict[str, Dict[str, Any]] = {}
+
+    def _log(self, level: str, message: str) -> None:
+        """Lightweight logger; DEBUG messages controlled by valves.debug."""
+        if level.upper() == "DEBUG" and not self.valves.debug:
+            return
+        print(f"[{level.upper()}] {message}")
 
     def _purge_call_contexts(self) -> None:
         """Remove expired call contexts to avoid unbounded memory growth."""
@@ -204,6 +215,44 @@ class Pipeline:
         except Exception:
             pass
 
+    def _get_or_create_chat_root_context(
+        self, chat_id: Optional[str], session_id: Optional[str]
+    ) -> Optional["object"]:
+        """Return a context representing a per-chat root span; create and end it once."""
+        if not chat_id:
+            return None
+        entry = self.chat_root_contexts.get(chat_id)
+        if entry is None:
+            try:
+                # Create a lightweight root span for the chat and end it immediately
+                root_span = self.tracer.start_span(
+                    name=f"chat.root", kind=SpanKind.INTERNAL
+                )
+                self._set_attr(root_span, "wbai.chat.id", chat_id)
+                self._set_attr(root_span, "wbai.session.id", session_id)
+                root_span.set_status(Status(StatusCode.OK))
+                sc = root_span.get_span_context()
+                root_span.end()
+                entry = {
+                    "trace_id": format(sc.trace_id, "032x"),
+                    "span_id": format(sc.span_id, "016x"),
+                }
+                self.chat_root_contexts[chat_id] = entry
+                self._log("INFO", f"Created chat root context | chat_id={chat_id} trace_id={entry['trace_id']} span_id={entry['span_id']}")
+            except Exception:
+                return None
+        try:
+            sc = SpanContext(
+                trace_id=int(entry["trace_id"], 16),
+                span_id=int(entry["span_id"], 16),
+                is_remote=False,
+                trace_flags=TraceFlags.SAMPLED,
+                trace_state=TraceState(),
+            )
+            return set_span_in_context(NonRecordingSpan(sc))
+        except Exception:
+            return None
+
     async def on_startup(self) -> None:
         """Initialize Phoenix OTEL when the service starts."""
         print("Phoenix OTEL pipeline starting up")
@@ -237,7 +286,7 @@ class Pipeline:
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming requests before they reach the model."""
-        print("Inlet function called")
+        self._log("DEBUG", "Inlet function called")
         span = None
         try:
             if not self.tracer:
@@ -266,8 +315,13 @@ class Pipeline:
                 if call_key and not metadata.get("message_id"):
                     metadata["message_id"] = call_key
 
-            # Try to parent this inlet to a previous inlet for the same call (to group traces per turn)
+            # Try to parent this inlet to a previous inlet for the same call (to group spans per turn)
             parent_ctx = self._get_parent_context_for_call(call_key)
+            parent_source = "call"
+            # If not available, parent to a per-chat root so all turns share one trace
+            if parent_ctx is None:
+                parent_ctx = self._get_or_create_chat_root_context(chat_id, session_id)
+                parent_source = "chat_root" if parent_ctx is not None else "none"
 
             # Start and end an inlet span; pass its context to outlet via metadata
             if parent_ctx is not None:
@@ -283,6 +337,7 @@ class Pipeline:
             self._set_attr(span, "wbai.session.id", session_id)
             self._set_attr(span, "wbai.message.id", message_id)
             self._set_attr(span, "wbai.task", task_name)
+            self._set_attr(span, "wbai.parent.source", parent_source)
             user_hash = self._hash_user_id(user_id)
             self._set_attr(span, "wbai.user.hash", user_hash)
 
@@ -295,7 +350,14 @@ class Pipeline:
                 span.add_event("message", {"role": role, "length": len(content)})
                 concatenated.append(str(content))
             input_value = "".join(concatenated)
-            self._set_attr(span, SpanAttributes.INPUT_VALUE, input_value[: self.max_attribute_length])
+            self._set_attr(span, SpanAttributes.INPUT_VALUE, input_value)
+            # Add complete bodies for debugging (capped)
+            try:
+                body_json = json.dumps(body, ensure_ascii=False)
+                self._set_attr(span, "wbai.body", body_json)
+                self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
+            except Exception as _:
+                pass
 
             # Expose trace context for outlet linking
             sc = span.get_span_context()
@@ -307,6 +369,14 @@ class Pipeline:
 
             # Persist the first inlet's context so any subsequent inlets for the same message can join the same trace
             self._maybe_store_call_context(call_key, sc)
+
+            self._log(
+                "INFO",
+                (
+                    f"Inlet grouped | chat_id={chat_id} session_id={session_id} message_id={message_id} "
+                    f"parent={parent_source} trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')}"
+                ),
+            )
 
             span.set_status(Status(StatusCode.OK))
         except Exception as e:
@@ -326,7 +396,7 @@ class Pipeline:
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        print("Outlet function called")
+        self._log("DEBUG", "Outlet function called")
         """Process responses from the model before they reach the user."""
         if not self.tracer:
             return body
@@ -345,8 +415,9 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        # Parent the outlet span to the inlet span using stored context
+        # Parent the outlet span to the inlet span using stored context; fallback to chat root
         parent_ctx = None
+        parent_source = "inlet"
         try:
             meta_ctx = metadata.get("trace_ctx")
             if isinstance(meta_ctx, dict) and meta_ctx.get("trace_id") and meta_ctx.get("span_id"):
@@ -360,14 +431,42 @@ class Pipeline:
                 parent_ctx = set_span_in_context(NonRecordingSpan(sc))
         except Exception:
             parent_ctx = None
+        if parent_ctx is None:
+            parent_ctx = self._get_or_create_chat_root_context(chat_id, session_id)
+            parent_source = "chat_root" if parent_ctx is not None else "none"
 
         span_kwargs = {"name": "llm.chat_completion.outlet", "kind": SpanKind.INTERNAL}
         if parent_ctx is not None:
             with self.tracer.start_as_current_span(**span_kwargs, context=parent_ctx) as span:
-                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
+                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
+                self._set_attr(span, "wbai.parent.source", parent_source)
+                try:
+                    body_json = json.dumps(body, ensure_ascii=False)
+                    self._set_attr(span, "wbai.body", body_json)
+                    self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
+                except Exception as _:
+                    pass
                 span.set_status(Status(StatusCode.OK))
         else:
             with self.tracer.start_as_current_span(**span_kwargs) as span:
-                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
+                self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
+                self._set_attr(span, "wbai.parent.source", parent_source)
+                try:
+                    body_json = json.dumps(body, ensure_ascii=False)
+                    self._set_attr(span, "wbai.body", body_json)
+                    self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
+                except Exception as _:
+                    pass
                 span.set_status(Status(StatusCode.OK))
+        try:
+            sc = trace.get_current_span().get_span_context()
+            self._log(
+                "INFO",
+                (
+                    f"Outlet grouped | chat_id={chat_id} session_id={session_id} message_id={message_id} "
+                    f"parent={parent_source} trace_id={format(sc.trace_id, '032x')} span_id={format(sc.span_id, '016x')}"
+                ),
+            )
+        except Exception:
+            pass
         return body
