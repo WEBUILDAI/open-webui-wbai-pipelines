@@ -154,12 +154,11 @@ class Pipeline:
         self.tracer = None
         self.span_processor = None
         self.max_attribute_length = int(os.getenv("WBAI_MAX_ATTR_LENGTH", "4000"))
-        # Ephemeral map to keep a root span context per user turn (call)
-        # Keyed strictly by message_id
+        # Legacy call-context map (kept for diagnostics only)
         self.call_contexts: Dict[str, Dict[str, Any]] = {}
         self.call_context_ttl_seconds = int(os.getenv("WBAI_CALL_CTX_TTL", "300"))
-        # Persistent per-chat root span contexts to group all turns in one chat
-        self.chat_root_contexts: Dict[str, Dict[str, Any]] = {}
+        # Per-request (per message) root contexts to group a single execution/turn
+        self.request_root_contexts: Dict[str, Dict[str, Any]] = {}
 
     def _log(self, level: str, message: str) -> None:
         """Lightweight logger; DEBUG messages controlled by valves.debug."""
@@ -215,21 +214,26 @@ class Pipeline:
         except Exception:
             pass
 
-    def _get_or_create_chat_root_context(
-        self, chat_id: Optional[str], session_id: Optional[str]
+    # Removed chat root logic to keep grouping deterministic per request only
+
+    def _get_or_create_request_root_context(
+        self,
+        message_id: Optional[str],
+        chat_id: Optional[str],
+        session_id: Optional[str],
     ) -> Optional["object"]:
-        """Return a context representing a per-chat root span; create and end it once."""
-        if not chat_id:
+        """Return a context representing a per-request root span (keyed by message_id)."""
+        if not message_id:
             return None
-        entry = self.chat_root_contexts.get(chat_id)
+        entry = self.request_root_contexts.get(message_id)
         if entry is None:
             try:
-                # Create a lightweight root span for the chat and end it immediately
                 root_span = self.tracer.start_span(
-                    name=f"chat.root", kind=SpanKind.INTERNAL
+                    name=f"request.root", kind=SpanKind.INTERNAL
                 )
                 self._set_attr(root_span, "wbai.chat.id", chat_id)
                 self._set_attr(root_span, "wbai.session.id", session_id)
+                self._set_attr(root_span, "wbai.message.id", message_id)
                 root_span.set_status(Status(StatusCode.OK))
                 sc = root_span.get_span_context()
                 root_span.end()
@@ -237,8 +241,11 @@ class Pipeline:
                     "trace_id": format(sc.trace_id, "032x"),
                     "span_id": format(sc.span_id, "016x"),
                 }
-                self.chat_root_contexts[chat_id] = entry
-                self._log("INFO", f"Created chat root context | chat_id={chat_id} trace_id={entry['trace_id']} span_id={entry['span_id']}")
+                self.request_root_contexts[message_id] = entry
+                self._log(
+                    "INFO",
+                    f"Created request root | message_id={message_id} trace_id={entry['trace_id']} span_id={entry['span_id']}",
+                )
             except Exception:
                 return None
         try:
@@ -315,13 +322,9 @@ class Pipeline:
                 if call_key and not metadata.get("message_id"):
                     metadata["message_id"] = call_key
 
-            # Try to parent this inlet to a previous inlet for the same call (to group spans per turn)
-            parent_ctx = self._get_parent_context_for_call(call_key)
-            parent_source = "call"
-            # If not available, parent to a per-chat root so all turns share one trace
-            if parent_ctx is None:
-                parent_ctx = self._get_or_create_chat_root_context(chat_id, session_id)
-                parent_source = "chat_root" if parent_ctx is not None else "none"
+            # Deterministic: always parent to per-request (message) root only
+            parent_ctx = self._get_or_create_request_root_context(message_id, chat_id, session_id)
+            parent_source = "request_root" if parent_ctx is not None else "none"
 
             # Start and end an inlet span; pass its context to outlet via metadata
             if parent_ctx is not None:
@@ -342,15 +345,13 @@ class Pipeline:
             self._set_attr(span, "wbai.user.hash", user_hash)
 
             messages = body.get("messages", [])
-            # Add lightweight events and capped input
-            concatenated = []
-            for m in messages:
-                role = m.get("role")
-                content = m.get("content", "")
+            # Only track the latest user message for input_value; still add events lightly
+            if messages:
+                last_msg = messages[-1]
+                role = last_msg.get("role")
+                content = str(last_msg.get("content", ""))
                 span.add_event("message", {"role": role, "length": len(content)})
-                concatenated.append(str(content))
-            input_value = "".join(concatenated)
-            self._set_attr(span, SpanAttributes.INPUT_VALUE, input_value)
+                self._set_attr(span, SpanAttributes.INPUT_VALUE, content)
             # Add complete bodies for debugging (capped)
             try:
                 body_json = json.dumps(body, ensure_ascii=False)
@@ -415,25 +416,9 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        # Parent the outlet span to the inlet span using stored context; fallback to chat root
-        parent_ctx = None
-        parent_source = "inlet"
-        try:
-            meta_ctx = metadata.get("trace_ctx")
-            if isinstance(meta_ctx, dict) and meta_ctx.get("trace_id") and meta_ctx.get("span_id"):
-                sc = SpanContext(
-                    trace_id=int(meta_ctx["trace_id"], 16),
-                    span_id=int(meta_ctx["span_id"], 16),
-                    is_remote=False,
-                    trace_flags=TraceFlags(TraceFlags.SAMPLED),
-                    trace_state=TraceState(),
-                )
-                parent_ctx = set_span_in_context(NonRecordingSpan(sc))
-        except Exception:
-            parent_ctx = None
-        if parent_ctx is None:
-            parent_ctx = self._get_or_create_chat_root_context(chat_id, session_id)
-            parent_source = "chat_root" if parent_ctx is not None else "none"
+        # Deterministic: parent outlet to the per-request root only
+        parent_ctx = self._get_or_create_request_root_context(message_id, chat_id, session_id)
+        parent_source = "request_root" if parent_ctx is not None else "none"
 
         span_kwargs = {"name": "llm.chat_completion.outlet", "kind": SpanKind.INTERNAL}
         if parent_ctx is not None:
