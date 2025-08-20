@@ -11,13 +11,9 @@ requirements: arize-phoenix-otel, openinference-instrumentation-openai
 from typing import List, Optional, Dict, Any
 import os
 import uuid
-import json
 
-from utils.pipelines.main import get_last_assistant_message
 from pydantic import BaseModel
 from phoenix.otel import register
-from opentelemetry import trace
-from opentelemetry.trace import Span
 from openinference.instrumentation.openai import OpenAIInstrumentor
 
 
@@ -39,14 +35,8 @@ class Pipeline:
         phoenix_collector_endpoint: Optional[str] = None
 
     def initialize_phoenix(self) -> None:
-        """Initialize the Phoenix client and OpenTelemetry tracer."""
+        """Initialize or re-initialize Phoenix with auto-instrumentation."""
         try:
-            # Only (re)register once per process
-            if getattr(self, "_phoenix_initialized", False):
-                if self.tracer is None:
-                    self.tracer = trace.get_tracer("open-webui.phoenix_pipeline")
-                return
-
             # Load configuration from valves/env
             if self.valves.phoenix_api_key:
                 os.environ["PHOENIX_API_KEY"] = self.valves.phoenix_api_key
@@ -65,20 +55,23 @@ class Pipeline:
                     endpoint = f"{endpoint}/v1/traces"
                 os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = endpoint
 
-            # Register Phoenix tracer with HTTP transport (avoid duplicate global registration)
+            # If already instrumented, uninstrument to allow re-instrumentation with the new provider
+            try:
+                OpenAIInstrumentor().uninstrument()
+            except Exception:
+                pass
+
+            # Set the global provider only on first initialization to avoid override warnings
+            set_global = not getattr(self, "_phoenix_initialized", False)
+
             self.tracer_provider = register(
                 headers={"authorization": os.getenv("PHOENIX_API_KEY") or ""},
                 endpoint=os.getenv("PHOENIX_COLLECTOR_ENDPOINT"),
-                auto_instrument=False,
+                auto_instrument=True,
+                set_global_tracer_provider=set_global,
             )
 
-            # Instrument OpenAI once, using the same provider
-            if not getattr(self, "_openai_instrumented", False):
-                OpenAIInstrumentor().instrument(tracer_provider=self.tracer_provider)
-                self._openai_instrumented = True
-
-            # Create tracer for manual spans
-            self.tracer = trace.get_tracer("open-webui.phoenix_pipeline")
+            # Phoenix auto-instrumentation will (re)instrument OpenAI with our provider
             self._phoenix_initialized = True
 
         except Exception as e:
@@ -100,11 +93,7 @@ class Pipeline:
         )
         
         self.tracer_provider = None
-        self.tracer = None
         self._phoenix_initialized = False
-        self._openai_instrumented = False
-        # Active spans keyed by chat_id
-        self._active_spans: Dict[str, Span] = {}
 
     async def on_startup(self):
         """Initialize Phoenix when the service starts."""
@@ -120,125 +109,28 @@ class Pipeline:
 
     async def on_valves_updated(self):
         """Reset Phoenix client when valves are updated."""
-        print("Valves updated, resetting Phoenix client")
-        # Allow re-init on next request
-        self._phoenix_initialized = False
+        print("Valves updated, re-initializing Phoenix registration")
         self.initialize_phoenix()
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming requests before they reach the model."""
-        print(f"Inlet function called with body: {body} and user: {user}")
+        print("Phoenix pipeline inlet")
 
-        if not self.tracer:
+        if not self._phoenix_initialized:
             self.initialize_phoenix()
-            if not self.tracer:
-                return body
         
         metadata = body.get("metadata", {})
         chat_id = metadata.get("chat_id", str(uuid.uuid4()))
-        
-        # Handle temporary chats
         if chat_id == "local":
             session_id = metadata.get("session_id")
             chat_id = f"temporary-session-{session_id}"
-        
         metadata["chat_id"] = chat_id
         body["metadata"] = metadata
-        
-        # Create attributes for the span
-        model = body.get("model", "unknown")
-        attributes = {
-            "conversation_id": chat_id,
-            "model": model,
-            "interface": "open-webui",
-            "task": "user_request"
-        }
-        
-        # Add user ID if available
-        user_email = user.get("email") if user else None
-        if user_email:
-            attributes["user_id"] = user_email
-        
-        # Start or reuse a conversation span per chat
-        span = self._active_spans.get(chat_id)
-        if span is None:
-            span = self.tracer.start_span(f"conversation:{chat_id}")
-            self._active_spans[chat_id] = span
-
-        # Update attributes on the active span
-        for key, value in attributes.items():
-            span.set_attribute(key, value)
-
-        # Persist the incoming messages for later aggregation
-        try:
-            last_three = body.get("messages", [])[-3:]
-            span.set_attribute("messages.last_three", json.dumps(last_three))
-        except Exception:
-            # Do not fail pipeline on serialization issues
-            pass
-        
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process responses from the model before they reach the user."""
-        print(f"Outlet function called with body: {body}")
-        if not self.tracer:
+        print("Phoenix pipeline outlet")
+        if not self._phoenix_initialized:
             return body
-        
-        chat_id = body.get("chat_id", "unknown")
-        
-        # Handle temporary chats
-        if chat_id == "local":
-            session_id = body.get("session_id")
-            chat_id = f"temporary-session-{session_id}"
-        
-        # Get the model response
-        assistant_message = get_last_assistant_message(body["messages"])
-        assistant_message_obj = get_last_assistant_message_obj(body["messages"])
-        
-        # Extract basic attributes
-        attributes = {
-            "conversation_id": chat_id,
-            "model": body.get("model", "unknown"),
-            "interface": "open-webui",
-            "task": "llm_response"
-        }
-        
-        # Add token usage if available
-        if assistant_message_obj and "usage" in assistant_message_obj:
-            usage = assistant_message_obj["usage"]
-            if isinstance(usage, dict):
-                input_tokens = usage.get("prompt_eval_count") or usage.get("prompt_tokens")
-                output_tokens = usage.get("eval_count") or usage.get("completion_tokens")
-                
-                if input_tokens is not None and output_tokens is not None:
-                    attributes["tokens.input"] = input_tokens
-                    attributes["tokens.output"] = output_tokens
-                    attributes["tokens.total"] = input_tokens + output_tokens
-        
-        # Fetch active span; if missing, create a best-effort span
-        span = self._active_spans.get(chat_id)
-        if span is None:
-            span = self.tracer.start_span(f"conversation:{chat_id}")
-
-        # Update span attributes
-        for key, value in attributes.items():
-            span.set_attribute(key, value)
-
-        # Attach messages summary and model output
-        try:
-            last_three = body.get("messages", [])[-3:]
-            span.set_attribute("messages.last_three", json.dumps(last_three))
-        except Exception:
-            pass
-
-        span.set_attribute("output", assistant_message)
-
-        # End the span for this conversation round
-        try:
-            span.end()
-        finally:
-            if chat_id in self._active_spans:
-                del self._active_spans[chat_id]
-        
         return body
