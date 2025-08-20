@@ -92,7 +92,10 @@ class Pipeline:
                 print(f"Warning: Could not shutdown previous span processor: {e}")
 
             tracer_provider = TracerProvider(resource=resource)
-            trace.set_tracer_provider(tracer_provider)
+            # Only set global tracer provider if it's not already set to avoid override warning
+            current_provider = trace.get_tracer_provider()
+            if not isinstance(current_provider, TracerProvider) or self.tracer_provider is None:
+                trace.set_tracer_provider(tracer_provider)
             self.tracer_provider = tracer_provider
             
             # Create and register exporter
@@ -135,6 +138,7 @@ class Pipeline:
         self.tracer_provider = None
         self.tracer = None
         self.span_processor = None
+        self.max_attribute_length = int(os.getenv("WBAI_MAX_ATTR_LENGTH", "4000"))
 
     async def on_startup(self) -> None:
         """Initialize Phoenix OTEL when the service starts."""
