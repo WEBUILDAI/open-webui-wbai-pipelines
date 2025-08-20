@@ -13,6 +13,7 @@ import os
 import uuid
 import hashlib
 from typing import Dict, List, Optional, Any
+import time
 from openinference.semconv.resource import ResourceAttributes as OIResourceAttributes
 from openinference.semconv.trace import SpanAttributes
 from opentelemetry import trace
@@ -150,6 +151,58 @@ class Pipeline:
         self.tracer = None
         self.span_processor = None
         self.max_attribute_length = int(os.getenv("WBAI_MAX_ATTR_LENGTH", "4000"))
+        # Ephemeral map to keep a root span context per user turn (call)
+        # Keyed strictly by message_id
+        self.call_contexts: Dict[str, Dict[str, Any]] = {}
+        self.call_context_ttl_seconds = int(os.getenv("WBAI_CALL_CTX_TTL", "300"))
+
+    def _purge_call_contexts(self) -> None:
+        """Remove expired call contexts to avoid unbounded memory growth."""
+        now = time.time()
+        expired_keys = [
+            key for key, entry in self.call_contexts.items()
+            if (now - entry.get("ts", 0)) > self.call_context_ttl_seconds
+        ]
+        for key in expired_keys:
+            try:
+                del self.call_contexts[key]
+            except Exception:
+                pass
+
+    def _get_parent_context_for_call(self, call_key: Optional[str]):
+        """Return an OTel context built from a stored span context for a call/message key, if any."""
+        if not call_key:
+            return None
+        self._purge_call_contexts()
+        entry = self.call_contexts.get(call_key)
+        if not entry:
+            return None
+        try:
+            sc = SpanContext(
+                trace_id=int(entry["trace_id"], 16),
+                span_id=int(entry["span_id"], 16),
+                is_remote=False,
+                trace_flags=TraceFlags.SAMPLED,
+                trace_state=TraceState(),
+            )
+            return set_span_in_context(NonRecordingSpan(sc))
+        except Exception:
+            return None
+
+    def _maybe_store_call_context(self, call_key: Optional[str], sc: "SpanContext") -> None:
+        """Store the span context for a call/message if not already present."""
+        if not call_key:
+            return
+        if call_key in self.call_contexts:
+            return
+        try:
+            self.call_contexts[call_key] = {
+                "trace_id": format(sc.trace_id, "032x"),
+                "span_id": format(sc.span_id, "016x"),
+                "ts": time.time(),
+            }
+        except Exception:
+            pass
 
     async def on_startup(self) -> None:
         """Initialize Phoenix OTEL when the service starts."""
@@ -206,8 +259,21 @@ class Pipeline:
             if chat_id == "local":
                 chat_id = f"temporary-session-{session_id}"
 
+            # Compute a stable per-call key from message_id
+            call_key = metadata.get("message_id")
+            if not call_key:
+                call_key = body.get("id")
+                if call_key and not metadata.get("message_id"):
+                    metadata["message_id"] = call_key
+
+            # Try to parent this inlet to a previous inlet for the same call (to group traces per turn)
+            parent_ctx = self._get_parent_context_for_call(call_key)
+
             # Start and end an inlet span; pass its context to outlet via metadata
-            span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
+            if parent_ctx is not None:
+                span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL, context=parent_ctx)
+            else:
+                span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
             # Attributes
             self._set_attr(span, SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
             self._set_attr(span, SpanAttributes.SESSION_ID, session_id)
@@ -238,6 +304,9 @@ class Pipeline:
                 "span_id": format(sc.span_id, "016x"),
             })
             body["metadata"] = metadata
+
+            # Persist the first inlet's context so any subsequent inlets for the same message can join the same trace
+            self._maybe_store_call_context(call_key, sc)
 
             span.set_status(Status(StatusCode.OK))
         except Exception as e:
@@ -301,5 +370,4 @@ class Pipeline:
             with self.tracer.start_as_current_span(**span_kwargs) as span:
                 self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
                 span.set_status(Status(StatusCode.OK))
-
         return body
