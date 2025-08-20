@@ -168,6 +168,53 @@ class Pipeline:
             return
         print(f"[{level.upper()}] {message}")
 
+    def _set_oi(self, span: "trace.Span", const_name: str, fallback_key: str, value: Optional[Any]) -> None:
+        """Set an OpenInference attribute by SpanAttributes constant name with safe fallback.
+
+        If the provided constant is not present in SpanAttributes (version skew), the
+        raw fallback key (string) will be used instead.
+        """
+        if value is None:
+            return
+        try:
+            key = getattr(SpanAttributes, const_name)
+        except Exception:
+            key = fallback_key
+        self._set_attr(span, key, value)
+
+    def _set_messages_attributes(
+        self,
+        span: "trace.Span",
+        prefix: str,
+        messages: List[dict],
+        limit: Optional[int] = None,
+    ) -> None:
+        """Flatten messages into OpenInference llm.input_messages / llm.output_messages attributes.
+
+        Args:
+            span: active span
+            prefix: either "input.messages" or "output.messages"
+            messages: list of {role, content}
+            limit: optional cap on number of messages to export
+        """
+        try:
+            count = len(messages)
+            if limit is not None:
+                count = min(count, limit)
+                msgs = messages[-count:]
+            else:
+                msgs = messages
+            for idx, msg in enumerate(msgs):
+                role = msg.get("role")
+                content = msg.get("content")
+                if role is not None:
+                    span.set_attribute(f"llm.{prefix}.{idx}.message.role", role)
+                if content is not None:
+                    span.set_attribute(f"llm.{prefix}.{idx}.message.content", str(content))
+        except Exception:
+            # Best-effort only
+            pass
+
     def _purge_call_contexts(self) -> None:
         """Remove expired call contexts to avoid unbounded memory growth."""
         now = time.time()
@@ -330,7 +377,17 @@ class Pipeline:
             # Attributes
             self._set_attr(span, SpanAttributes.OPENINFERENCE_SPAN_KIND, "llm")
             self._set_attr(span, SpanAttributes.SESSION_ID, session_id)
-            self._set_attr(span, SpanAttributes.LLM_MODEL_NAME, model_id)
+            # Model and provider/system per OpenInference
+            self._set_oi(span, "LLM_MODEL_NAME", "llm.model_name", model_id)
+            model_info = metadata.get("model") if isinstance(metadata.get("model"), dict) else {}
+            provider_guess = (
+                (model_info.get("openai") or {}).get("owned_by")
+                or model_info.get("owned_by")
+                or metadata.get("provider")
+            )
+            system_guess = "openai" if provider_guess in ("openai", "azure") else None
+            self._set_oi(span, "LLM_PROVIDER", "llm.provider", provider_guess)
+            self._set_oi(span, "LLM_SYSTEM", "llm.system", system_guess)
             self._set_attr(span, "wbai.interface", interface)
             self._set_attr(span, "wbai.chat.id", chat_id)
             self._set_attr(span, "wbai.session.id", session_id)
@@ -343,11 +400,13 @@ class Pipeline:
             messages = body.get("messages", [])
             # Only track the latest user message for input_value; still add events lightly
             if messages:
+                # Export a small window of recent messages for traceability
+                self._set_messages_attributes(span, "input_messages", messages, limit=5)
                 last_msg = messages[-1]
                 role = last_msg.get("role")
                 content = str(last_msg.get("content", ""))
                 span.add_event("message", {"role": role, "length": len(content)})
-                self._set_attr(span, SpanAttributes.INPUT_VALUE, content)
+                self._set_oi(span, "INPUT_VALUE", "input.value", content)
             # Add complete bodies for debugging (capped)
             try:
                 body_json = json.dumps(body, ensure_ascii=False)
@@ -417,12 +476,49 @@ class Pipeline:
         if span is None:
             # Fallback: create a span to avoid losing data
             span = self.tracer.start_span("llm.chat_completion", kind=SpanKind.INTERNAL)
-        self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or ""))
+        self._set_oi(span, "OUTPUT_VALUE", "output.value", (assistant_message or ""))
         try:
             body_json = json.dumps(body, ensure_ascii=False)
             self._set_attr(span, "wbai.body", body_json)
             self._set_attr(span, "wbai.metadata", json.dumps(metadata, ensure_ascii=False))
         except Exception as _:
+            pass
+        # Export the last assistant message for observability
+        try:
+            messages = body.get("messages", [])
+            assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+            if assistant_msgs:
+                self._set_messages_attributes(span, "output_messages", assistant_msgs[-1:])
+        except Exception:
+            pass
+        # Token usage per OpenInference where available
+        try:
+            if isinstance(assistant_message_obj, dict):
+                usage = assistant_message_obj.get("usage", {}) or {}
+                if isinstance(usage, dict):
+                    in_tok = (
+                        usage.get("prompt_eval_count")
+                        or usage.get("prompt_tokens")
+                        or usage.get("input_tokens")
+                    )
+                    out_tok = (
+                        usage.get("eval_count")
+                        or usage.get("completion_tokens")
+                        or usage.get("output_tokens")
+                    )
+                    total_tok = usage.get("total_tokens")
+                    self._set_oi(span, "LLM_TOKEN_COUNT_PROMPT", "llm.token_count.prompt", in_tok)
+                    self._set_oi(span, "LLM_TOKEN_COUNT_COMPLETION", "llm.token_count.completion", out_tok)
+                    self._set_oi(span, "LLM_TOKEN_COUNT_TOTAL", "llm.token_count.total", total_tok)
+                    prompt_details = usage.get("prompt_tokens_details") or {}
+                    if isinstance(prompt_details, dict):
+                        self._set_oi(span, "LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ", "llm.token_count.prompt_details.cache_read", prompt_details.get("cached_tokens"))
+                        self._set_oi(span, "LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO", "llm.token_count.prompt_details.audio", prompt_details.get("audio_tokens"))
+                    completion_details = usage.get("completion_tokens_details") or {}
+                    if isinstance(completion_details, dict):
+                        self._set_oi(span, "LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING", "llm.token_count.completion_details.reasoning", completion_details.get("reasoning_tokens"))
+                        self._set_oi(span, "LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO", "llm.token_count.completion_details.audio", completion_details.get("audio_tokens"))
+        except Exception:
             pass
         span.set_status(Status(StatusCode.OK))
         try:
