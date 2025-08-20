@@ -193,7 +193,7 @@ class Pipeline:
                 trace_id=int(entry["trace_id"], 16),
                 span_id=int(entry["span_id"], 16),
                 is_remote=False,
-                trace_flags=TraceFlags.SAMPLED,
+                trace_flags=TraceFlags(TraceFlags.SAMPLED),
                 trace_state=TraceState(),
             )
             return set_span_in_context(NonRecordingSpan(sc))
@@ -425,7 +425,7 @@ class Pipeline:
                     trace_id=int(meta_ctx["trace_id"], 16),
                     span_id=int(meta_ctx["span_id"], 16),
                     is_remote=False,
-                    trace_flags=TraceFlags.SAMPLED,
+                    trace_flags=TraceFlags(TraceFlags.SAMPLED),
                     trace_state=TraceState(),
                 )
                 parent_ctx = set_span_in_context(NonRecordingSpan(sc))
