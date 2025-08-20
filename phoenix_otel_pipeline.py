@@ -91,12 +91,14 @@ class Pipeline:
             except Exception as e:
                 print(f"Warning: Could not shutdown previous span processor: {e}")
 
-            tracer_provider = TracerProvider(resource=resource)
-            # Only set global tracer provider if it's not already set to avoid override warning
+            # Use existing global provider if present; otherwise create and set one
             current_provider = trace.get_tracer_provider()
-            if not isinstance(current_provider, TracerProvider) or self.tracer_provider is None:
+            if isinstance(current_provider, TracerProvider):
+                self.tracer_provider = current_provider
+            else:
+                tracer_provider = TracerProvider(resource=resource)
                 trace.set_tracer_provider(tracer_provider)
-            self.tracer_provider = tracer_provider
+                self.tracer_provider = tracer_provider
             
             # Create and register exporter
             span_exporter = OTLPSpanExporter(endpoint=collector_endpoint, headers=headers)
