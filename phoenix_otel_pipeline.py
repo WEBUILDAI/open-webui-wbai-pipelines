@@ -20,7 +20,16 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Status, StatusCode, SpanKind, Link, SpanContext, TraceFlags, TraceState
+from opentelemetry.trace import (
+    Status,
+    StatusCode,
+    SpanKind,
+    SpanContext,
+    TraceFlags,
+    TraceState,
+    NonRecordingSpan,
+    set_span_in_context,
+)
 from opentelemetry.semconv.resource import ResourceAttributes as OTelResourceAttributes
 from pydantic import BaseModel
 
@@ -267,8 +276,8 @@ class Pipeline:
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        # Attempt to link to inlet span using stored context
-        link = None
+        # Parent the outlet span to the inlet span using stored context
+        parent_ctx = None
         try:
             meta_ctx = metadata.get("trace_ctx")
             if isinstance(meta_ctx, dict) and meta_ctx.get("trace_id") and meta_ctx.get("span_id"):
@@ -279,13 +288,13 @@ class Pipeline:
                     trace_flags=TraceFlags.SAMPLED,
                     trace_state=TraceState(),
                 )
-                link = Link(sc)
+                parent_ctx = set_span_in_context(NonRecordingSpan(sc))
         except Exception:
-            link = None
+            parent_ctx = None
 
         span_kwargs = {"name": "llm.chat_completion.outlet", "kind": SpanKind.INTERNAL}
-        if link is not None:
-            with self.tracer.start_as_current_span(**span_kwargs, links=[link]) as span:
+        if parent_ctx is not None:
+            with self.tracer.start_as_current_span(**span_kwargs, context=parent_ctx) as span:
                 self._set_attr(span, SpanAttributes.OUTPUT_VALUE, (assistant_message or "")[: self.max_attribute_length])
                 span.set_status(Status(StatusCode.OK))
         else:
