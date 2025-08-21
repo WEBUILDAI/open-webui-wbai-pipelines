@@ -360,6 +360,11 @@ class Pipeline:
             model_id = metadata.get("model_id")
             task_name = metadata.get("task")
 
+            # Skip internal title generation tasks from monitoring
+            if task_name == "title_generation":
+                self._log("DEBUG", "Skipping inlet for task=title_generation")
+                return body
+
             # Handle temporary chats
             if chat_id == "local":
                 chat_id = f"temporary-session-{session_id}"
@@ -456,6 +461,10 @@ class Pipeline:
             return body
         
         metadata = body.get("metadata", {}) or {}
+        # Skip internal title generation tasks from monitoring
+        if (metadata.get("task") or body.get("task")) == "title_generation":
+            self._log("DEBUG", "Skipping outlet for task=title_generation")
+            return body
         chat_id = body.get("chat_id") or metadata.get("chat_id") or "unknown"
         session_id = body.get("session_id") or metadata.get("session_id")
         message_id = body.get("id") or metadata.get("message_id")
