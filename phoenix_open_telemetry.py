@@ -6,6 +6,7 @@ version: 0.3.1
 license: MIT
 description: A filter pipeline that exports OpenTelemetry spans to Arize Phoenix using the base OTel SDK.
              Uses standardized OpenInference SpanAttributes exclusively (no legacy/custom keys).
+requirements: openinference-instrumentation==0.1.37, openinference-instrumentation-openai==0.1.31, openinference-semantic-conventions==0.1.21, opentelemetry-api==1.36.0, opentelemetry-exporter-otlp==1.36.0, opentelemetry-exporter-otlp-proto-common==1.36.0, opentelemetry-exporter-otlp-proto-grpc==1.36.0, opentelemetry-exporter-otlp-proto-http==1.36.0, opentelemetry-instrumentation==0.57b0, opentelemetry-proto==1.36.0, opentelemetry-sdk==1.36.0, opentelemetry-semantic-conventions==0.57b0
 """
 
 from typing import List, Optional, Dict, Any
