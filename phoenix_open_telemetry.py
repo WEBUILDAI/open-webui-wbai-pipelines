@@ -38,7 +38,7 @@ def _default_phoenix_collector_endpoint() -> str:
         return f"http://{get_env_host()}:{get_env_port()}/v1/traces"
     except Exception:
         # Fallback: your hosted Phoenix/OTel endpoint (Azure Container Apps example)
-        return "https://baucaprdeuw-llm-monitoring.kindcoast-fdb4e0a7.westeurope.azurecontainerapps.io/v1/traces"
+        return "http://localhost:8080/v1/traces"
 
 
 def get_last_assistant_message_obj(messages: List[dict]) -> dict:
@@ -106,6 +106,9 @@ class Pipeline:
 
         # Logging
         self.suppressed_logs = set()
+
+        # Track last-applied OTel config to support dynamic reconfiguration
+        self._last_config: Optional[Dict[str, Any]] = None
 
         self.log("Phoenix OTel Pipeline initialized")
 
@@ -193,10 +196,20 @@ class Pipeline:
 
     async def on_valves_updated(self):
         self.log("Valves updated, reconfiguring OTel")
-        self._configure_otel()
+        new_config = self._get_otel_config()
+        if not self._otel_ready:
+            self.log("OTel not initialized yet; performing initial configuration")
+            self._configure_otel()
+            return
+        if self._last_config != new_config:
+            self.log("OTel config changed; resetting provider to apply updates")
+            self._reset_otel()
+            self._configure_otel(force=True)
+        else:
+            self.log("No OTel config changes detected; keeping current configuration")
 
-    def _configure_otel(self):
-        if self._otel_ready:
+    def _configure_otel(self, force: bool = False):
+        if self._otel_ready and not force:
             self.log("OTel already configured, skipping reset")
             return
 
@@ -242,6 +255,62 @@ class Pipeline:
 
         self._otel_ready = True
         self.log(f"OTel configured successfully | endpoint={self.valves.collector_endpoint}")
+        self._last_config = self._get_otel_config()
+
+    def _get_otel_config(self) -> Dict[str, Any]:
+        return {
+            "project_name": self.valves.project_name,
+            "collector_endpoint": self.valves.collector_endpoint,
+            "api_key": self.valves.api_key,
+            "use_batch_processor": self.valves.use_batch_processor,
+        }
+
+    def _reset_otel(self):
+        """Safely tear down existing spans and tracer provider before reconfiguration."""
+        self.log("Resetting OTel: closing open spans and shutting down current provider")
+
+        # Close open turn spans first
+        for key, span in list(self.turn_spans.items()):
+            try:
+                span.end()
+                self.log(f"Closed turn span during reset: {key}")
+            except Exception as e:
+                self.log(f"Error closing turn span {key} during reset: {e}")
+        self.turn_spans.clear()
+
+        # Close open per-turn parent spans
+        for key, pspan in list(self.turn_parent_spans.items()):
+            try:
+                pspan.end()
+                self.log(f"Closed turn parent span during reset: {key}")
+            except Exception as e:
+                self.log(f"Error closing turn parent span {key} during reset: {e}")
+        self.turn_parent_spans.clear()
+        self.turn_contexts.clear()
+
+        # Then close root spans
+        for chat_id, span in list(self.root_spans.items()):
+            try:
+                span.end()
+                self.log(f"Closed root span during reset for chat: {chat_id}")
+            except Exception as e:
+                self.log(f"Error closing root span for chat {chat_id} during reset: {e}")
+        self.root_spans.clear()
+        self.root_contexts.clear()
+
+        try:
+            if self.tracer_provider is not None:
+                self.log("Forcing flush before provider shutdown (reset)")
+                self.tracer_provider.force_flush(timeout_millis=10000)
+                self.log("Shutting down tracer provider (reset)")
+                self.tracer_provider.shutdown()
+        except Exception as e:
+            self.log(f"Error during tracer provider shutdown in reset: {e}")
+
+        # Clear provider and tracer references
+        self.tracer_provider = None
+        self.tracer = None
+        self._otel_ready = False
 
     # ---------- standardized attribute helpers ----------
     def _infer_provider_system(self, model_id: Optional[str], metadata: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -409,20 +478,20 @@ class Pipeline:
             return
 
         self.log(f"Creating root span for chat: {chat_id}, user: {user_email or 'anonymous'}")
-        root = self.tracer.start_span(name=f"chat")
-        root.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "CHAIN")
-        root.set_attribute(SpanAttributes.GRAPH_NODE_ID, chat_id)
-        root.set_attribute(SpanAttributes.GRAPH_NODE_NAME, "Chat")
-        root.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-        if user_email:
-            root.set_attribute(SpanAttributes.USER_ID, user_email)
-        if tags_list:
-            root.set_attribute(SpanAttributes.TAG_TAGS, tags_list)
-        if metadata:
-            root.set_attribute(SpanAttributes.METADATA, self._safe_json(metadata))
+        with self.tracer.start_as_current_span(name=f"chat") as root:
+            root.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "CHAIN")
+            root.set_attribute(SpanAttributes.GRAPH_NODE_ID, chat_id)
+            root.set_attribute(SpanAttributes.GRAPH_NODE_NAME, "Chat")
+            root.set_attribute(SpanAttributes.SESSION_ID, chat_id)
+            if user_email:
+                root.set_attribute(SpanAttributes.USER_ID, user_email)
+            if tags_list:
+                root.set_attribute(SpanAttributes.TAG_TAGS, tags_list)
+            if metadata:
+                root.set_attribute(SpanAttributes.METADATA, self._safe_json(metadata))
 
-        self.root_spans[chat_id] = root
-        self.root_contexts[chat_id] = trace_api.set_span_in_context(root)
+            self.root_spans[chat_id] = root
+            self.root_contexts[chat_id] = trace_api.set_span_in_context(root)
         self.log(f"Successfully created root span for chat: {chat_id}")
 
     def _build_tags(self, task_name: str) -> list:
@@ -435,6 +504,7 @@ class Pipeline:
 
     # ---------- inlet ----------
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
+        self.log(f"Inlet processing - body: {body}") 
         if self.tracer is None:
             self.log("Tracer not available, skipping inlet processing")
             return body
@@ -475,19 +545,7 @@ class Pipeline:
             if key not in self.turn_parent_spans:
                 self.log(f"Creating per-turn parent span for {key}")
                 parent_span = self.tracer.start_span(name="conversation_turn", context=ctx)
-                parent_uid = format(parent_span.get_span_context().span_id, "016x")
                 parent_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "CHAIN")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_ID, f"turn:{chat_id}:{parent_uid}")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_NAME, "Conversation Turn")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_PARENT_ID, chat_id)
-                parent_span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-                if user_email:
-                    parent_span.set_attribute(SpanAttributes.USER_ID, user_email)
-                if tags_list:
-                    parent_span.set_attribute(SpanAttributes.TAG_TAGS, tags_list)
-                meta_snapshot = dict(metadata)
-                meta_snapshot.setdefault("turn_id", turn_id)
-                parent_span.set_attribute(SpanAttributes.METADATA, self._safe_json(meta_snapshot))
                 self.turn_parent_spans[key] = parent_span
                 self.turn_contexts[key] = trace_api.set_span_in_context(parent_span)
                 self.log(f"Successfully created per-turn parent span for {key}")
@@ -533,6 +591,7 @@ class Pipeline:
 
     # ---------- outlet ----------
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
+        self.log(f"Outlet processing - body: {body}") 
         if self.tracer is None:
             self.log("Tracer not available, skipping outlet processing")
             return body
@@ -570,13 +629,7 @@ class Pipeline:
             if parent_span is None:
                 self.log(f"Creating per-turn parent span in outlet for {key}")
                 parent_span = self.tracer.start_span(name="conversation_turn", context=ctx)
-                parent_uid = format(parent_span.get_span_context().span_id, "016x")
                 parent_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, "CHAIN")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_ID, f"turn:{chat_id}:{parent_uid}")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_NAME, "Conversation Turn")
-                parent_span.set_attribute(SpanAttributes.GRAPH_NODE_PARENT_ID, chat_id)
-                parent_span.set_attribute(SpanAttributes.SESSION_ID, chat_id)
-                parent_span.set_attribute(SpanAttributes.METADATA, self._safe_json(dict(metadata, turn_id=turn_id)))
                 self.turn_parent_spans[key] = parent_span
                 self.turn_contexts[key] = trace_api.set_span_in_context(parent_span)
                 self.log(f"Created per-turn parent span in outlet for {key}")
